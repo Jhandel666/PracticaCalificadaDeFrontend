@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
-const mysql = require('mysql2/promise');
+require('dotenv').config();
+const { Pool } = require('pg');
 
 const app = express();
 const PORT = 4000;
@@ -8,14 +9,15 @@ const PORT = 4000;
 app.use(cors());
 app.use(express.json());
 
-const db = mysql.createPool({
-  host: 'localhost',
-  user: 'root',
-  password: '',
-  database: 'db_crud',
-  waitForConnections: true,
-  connectionLimit: 10,
-  queueLimit: 0
+const db = new Pool({
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT),
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
 const tablas = {
@@ -25,12 +27,12 @@ const tablas = {
     campos: ['descripcion']
   },
   clientes: {
-  tabla: 'clientes',
-  id: 'id_cliente',
-  campos: ['nombres', 'apellidos', 'direccion', 'telefono']
+    tabla: 'clientes',
+    id: 'id_cliente',
+    campos: ['nombres', 'apellidos', 'direccion', 'telefono']
   },
   productos: {
-    tabla: 'producto', // 👈 IMPORTANTE
+    tabla: 'producto',
     id: 'id_producto',
     campos: ['descripcion', 'precio', 'stock', 'id_categoria', 'id_proveedor']
   },
@@ -51,23 +53,43 @@ const validarCampos = (req, res, campos) => {
   return true;
 };
 
+const crearMarcadores = (cantidad, inicio = 1) => {
+  return Array.from({ length: cantidad }, (_, i) => `$${i + inicio}`).join(', ');
+};
+
 const crearCrud = (ruta, config) => {
   app.get(`/api/${ruta}`, async (req, res) => {
     try {
-      const [filas] = await db.query(`SELECT * FROM ${config.tabla} ORDER BY ${config.id} DESC`);
-      res.json(filas);
+      const resultado = await db.query(
+        `SELECT * FROM ${config.tabla} ORDER BY ${config.id} DESC`
+      );
+
+      res.json(resultado.rows);
     } catch (error) {
-      res.status(500).json({ mensaje: 'Error al listar registros', error: error.message });
+      res.status(500).json({
+        mensaje: 'Error al listar registros',
+        error: error.message
+      });
     }
   });
 
   app.get(`/api/${ruta}/:id`, async (req, res) => {
     try {
-      const [filas] = await db.query(`SELECT * FROM ${config.tabla} WHERE ${config.id} = ?`, [req.params.id]);
-      if (filas.length === 0) return res.status(404).json({ mensaje: 'Registro no encontrado' });
-      res.json(filas[0]);
+      const resultado = await db.query(
+        `SELECT * FROM ${config.tabla} WHERE ${config.id} = $1`,
+        [req.params.id]
+      );
+
+      if (resultado.rows.length === 0) {
+        return res.status(404).json({ mensaje: 'Registro no encontrado' });
+      }
+
+      res.json(resultado.rows[0]);
     } catch (error) {
-      res.status(500).json({ mensaje: 'Error al buscar registro', error: error.message });
+      res.status(500).json({
+        mensaje: 'Error al buscar registro',
+        error: error.message
+      });
     }
   });
 
@@ -77,16 +99,21 @@ const crearCrud = (ruta, config) => {
 
       const valores = config.campos.map((campo) => req.body[campo]);
       const columnas = config.campos.join(', ');
-      const marcas = config.campos.map(() => '?').join(', ');
+      const marcas = crearMarcadores(config.campos.length);
 
-      const [resultado] = await db.query(
-        `INSERT INTO ${config.tabla} (${columnas}) VALUES (${marcas})`,
+      const resultado = await db.query(
+        `INSERT INTO ${config.tabla} (${columnas})
+         VALUES (${marcas})
+         RETURNING *`,
         valores
       );
 
-      res.status(201).json({ [config.id]: resultado.insertId, ...req.body });
+      res.status(201).json(resultado.rows[0]);
     } catch (error) {
-      res.status(500).json({ mensaje: 'Error al guardar registro', error: error.message });
+      res.status(500).json({
+        mensaje: 'Error al guardar registro',
+        error: error.message
+      });
     }
   });
 
@@ -94,29 +121,53 @@ const crearCrud = (ruta, config) => {
     try {
       if (!validarCampos(req, res, config.campos)) return;
 
-      const asignaciones = config.campos.map((campo) => `${campo} = ?`).join(', ');
+      const asignaciones = config.campos
+        .map((campo, index) => `${campo} = $${index + 1}`)
+        .join(', ');
+
       const valores = config.campos.map((campo) => req.body[campo]);
       valores.push(req.params.id);
 
-      const [resultado] = await db.query(
-        `UPDATE ${config.tabla} SET ${asignaciones} WHERE ${config.id} = ?`,
+      const resultado = await db.query(
+        `UPDATE ${config.tabla}
+         SET ${asignaciones}
+         WHERE ${config.id} = $${config.campos.length + 1}
+         RETURNING *`,
         valores
       );
 
-      if (resultado.affectedRows === 0) return res.status(404).json({ mensaje: 'Registro no encontrado' });
-      res.json({ [config.id]: Number(req.params.id), ...req.body });
+      if (resultado.rows.length === 0) {
+        return res.status(404).json({ mensaje: 'Registro no encontrado' });
+      }
+
+      res.json(resultado.rows[0]);
     } catch (error) {
-      res.status(500).json({ mensaje: 'Error al actualizar registro', error: error.message });
+      res.status(500).json({
+        mensaje: 'Error al actualizar registro',
+        error: error.message
+      });
     }
   });
 
   app.delete(`/api/${ruta}/:id`, async (req, res) => {
     try {
-      const [resultado] = await db.query(`DELETE FROM ${config.tabla} WHERE ${config.id} = ?`, [req.params.id]);
-      if (resultado.affectedRows === 0) return res.status(404).json({ mensaje: 'Registro no encontrado' });
+      const resultado = await db.query(
+        `DELETE FROM ${config.tabla}
+         WHERE ${config.id} = $1
+         RETURNING *`,
+        [req.params.id]
+      );
+
+      if (resultado.rows.length === 0) {
+        return res.status(404).json({ mensaje: 'Registro no encontrado' });
+      }
+
       res.json({ mensaje: 'Registro eliminado correctamente' });
     } catch (error) {
-      res.status(500).json({ mensaje: 'Error al eliminar registro', error: error.message });
+      res.status(500).json({
+        mensaje: 'Error al eliminar registro',
+        error: error.message
+      });
     }
   });
 };
@@ -124,7 +175,16 @@ const crearCrud = (ruta, config) => {
 Object.entries(tablas).forEach(([ruta, config]) => crearCrud(ruta, config));
 
 app.get('/', (req, res) => {
-  res.send('API CRUD conectada a MySQL db_crud');
+  res.send('API CRUD conectada a PostgreSQL Supabase');
+});
+
+app.get('/test-db', async (req, res) => {
+  try {
+    const resultado = await db.query('SELECT NOW()');
+    res.json(resultado.rows[0]);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
 });
 
 app.listen(PORT, () => {
