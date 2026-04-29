@@ -50,6 +50,7 @@ const validarCampos = (req, res, campos) => {
       return false;
     }
   }
+
   return true;
 };
 
